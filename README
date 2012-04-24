@@ -1,0 +1,2 @@
+A POC for indexing data into Solr from multiple data sources.
+Ingests data from AWS S3, Relational Database, JCR, Twitter, with data enrichment from google map api, tweetsentiments, filtering and throttling.
