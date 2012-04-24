@@ -1,0 +1,168 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<beans xmlns="http://www.springframework.org/schema/beans"
+       xmlns:jdbc="http://www.springframework.org/schema/jdbc"
+       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+       xsi:schemaLocation="http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans.xsd
+        http://www.springframework.org/schema/jdbc http://www.springframework.org/schema/jdbc/spring-jdbc.xsd
+        http://camel.apache.org/schema/spring http://camel.apache.org/schema/spring/camel-spring.xsd">
+
+    <jdbc:embedded-database id="productDataSource" type="DERBY">
+        <jdbc:script location="classpath:/sql/init.sql"/>
+    </jdbc:embedded-database>
+
+    <bean id="entityManagerFactory" class="org.springframework.orm.jpa.LocalContainerEntityManagerFactoryBean">
+        <property name="persistenceUnitName" value="camel"/>
+        <property name="jpaVendorAdapter" ref="jpaAdapter"/>
+        <property name="dataSource" ref="productDataSource"/>
+    </bean>
+
+    <bean id="jpaAdapter" class="org.springframework.orm.jpa.vendor.OpenJpaVendorAdapter">
+        <property name="databasePlatform" value="org.apache.openjpa.jdbc.sql.DerbyDictionary"/>
+        <property name="database" value="DERBY"/>
+    </bean>
+
+    <bean id="repository" class="org.apache.jackrabbit.core.TransientRepository">
+        <constructor-arg value="target/repository.xml"/>
+        <constructor-arg value="target/repository"/>
+    </bean>
+
+    <bean id="latLongAggregationStrategy" class="com.ofbizian.pipeline.LatLongAggregationStrategy"/>
+
+    <camelContext xmlns="http://camel.apache.org/schema/spring">
+        <propertyPlaceholder id="properties" location="pipeline.properties"/>
+        <package>com.ofbizian.pipeline</package>
+
+        <!-- Consume files from AWS S3 and index them as they are. Commit approved docs instantly -->
+        <route>
+            <from uri="aws-s3://mycamelbucket2?deleteAfterRead=false&amp;delay=5000&amp;accessKey={{aws.accessKey}}&amp;secretKey={{aws.secretKey}}"/>
+            <convertBodyTo type="org.w3c.dom.Document"/>
+            <choice>
+                <when>
+                    <xpath>/add/doc[@status='approved']</xpath>
+                    <convertBodyTo type="java.lang.String"/>
+                    <to uri="direct:indexAndCommit"/>
+                </when>
+                <otherwise>
+                    <convertBodyTo type="java.lang.String"/>
+                    <to uri="direct:index"/>
+                </otherwise>
+            </choice>
+        </route>
+
+
+        <!-- Read 10 records from DB, and mark them as read -->
+        <!-- For each record's address get lat/long by calling google map api -->
+        <route>
+            <from uri="jpa://com.ofbizian.pipeline.Customer?consumer.namedQuery=newCustomers&amp;maximumResults=10&amp;delay=5000"/>
+            <enrich uri="direct:coordinateEnricher" strategyRef="latLongAggregationStrategy"/>
+            <to uri="direct:indexBean"/>
+        </route>
+        <route>
+            <from uri="direct:coordinateEnricher"/>
+            <setHeader headerName="CamelHttpQuery">
+                <simple>address='${body.address}'&amp;sensor=false</simple>
+            </setHeader>
+            <setBody>
+                <constant>1</constant>
+            </setBody>
+            <to uri="http://maps.google.com/maps/api/geocode/xml"/>
+            <convertBodyTo type="java.lang.String"/>
+            <setHeader headerName="lat">
+                <xpath resultType="java.lang.Double">//result[1]/geometry/location/lat/text()</xpath>
+            </setHeader>
+            <setHeader headerName="lng">
+                <xpath resultType="java.lang.Double">//result[1]/geometry/location/lng/text()</xpath>
+            </setHeader>
+        </route>
+
+
+        <!-- Listen for tweets containing the work luck, do sentiment analysis and index only positive ones -->
+        <route>
+            <from uri="twitter://streaming/filter?type=event&amp;keywords=luck&amp;consumerKey={{consumer.key}}&amp;consumerSecret={{consumer.secret}}&amp;accessToken={{access.token}}&amp;accessTokenSecret={{access.token.secret}}"/>
+            <setHeader headerName="CamelHttpQuery">
+                <language language="beanshell">
+                    "q=" + java.net.URLEncoder.encode(request.getBody().getText(), "UTF-8")
+                </language>
+            </setHeader>
+            <setHeader headerName="tweet">
+                <simple>${in.body}</simple>
+            </setHeader>
+            <throttle timePeriodMillis="1500">
+                <constant>1</constant>
+                <setBody>
+                    <constant>1</constant>
+                </setBody>
+                <to uri="http://data.tweetsentiments.com:8080/api/analyze.xml"/>
+                <setHeader headerName="sentiment">
+                    <xpath resultType="java.lang.Double">/sentiment/value/text()</xpath>
+                </setHeader>
+                <setBody>
+                    <simple>${in.header.tweet.text}</simple>
+                </setBody>
+                <filter>
+                    <simple>${in.header.sentiment} > 0</simple>
+                    <setHeader headerName="SolrField.id">
+                        <simple>${in.header.tweet.id}</simple>
+                    </setHeader>
+                    <setHeader headerName="SolrField.cat">
+                        <simple>${in.header.tweet.text}</simple>
+                    </setHeader>
+                    <setHeader headerName="SolrField.features">
+                        <simple>${in.header.tweet.user.id}</simple>
+                    </setHeader>
+                    <to uri="direct:index"/>
+                </filter>
+            </throttle>
+        </route>
+
+
+        <!-- Monitor a JCR for new node additions -->
+        <!-- Requires further processing of the event, like getting the actual content from JCR
+        <route>
+            <from uri="jcr://user:pass@repository/home/test?eventTypes=1&amp;deep=true&amp;synchronous=false"/>
+            <to uri="direct:index"/>
+        </route>
+        -->
+
+
+        <!-- Commit the changes every 1 minute -->
+        <route>
+            <from uri="timer://commit?fixedRate=true&amp;period=60s"/>
+            <to uri="direct:commit"/>
+        </route>
+
+
+        <route>
+            <from uri="direct:index"/>
+            <setHeader headerName="SolrOperation">
+                <constant>INSERT</constant>
+            </setHeader>
+
+            <to uri="solr://localhost:8983/solr"/>
+        </route>
+
+        <route>
+            <from uri="direct:indexBean"/>
+            <setHeader headerName="SolrOperation">
+                <constant>ADD_BEAN</constant>
+            </setHeader>
+
+            <to uri="solr://localhost:8983/solr"/>
+            <to uri="direct:commit"/>
+        </route>
+
+        <route>
+            <from uri="direct:commit"/>
+            <setHeader headerName="SolrOperation">
+                <constant>COMMIT</constant>
+            </setHeader>
+            <to uri="solr://localhost:8983/solr"/>
+        </route>
+
+        <route>
+            <from uri="direct:indexAndCommit"/>
+            <to uri="direct:index"/>
+            <to uri="direct:commit"/>
+        </route>
+    </camelContext>
+</beans>
